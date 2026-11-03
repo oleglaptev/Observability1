@@ -1,3 +1,4 @@
+https://github.com/oleglaptev/Observability1
 # Лабораторная работа №1 — Метрики и Prometheus
 
 Курс «Наблюдаемость распределённых систем»
