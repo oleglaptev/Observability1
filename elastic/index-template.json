@@ -1,0 +1,25 @@
+{
+  "index_patterns": ["app-logs-*"],
+  "priority": 100,
+  "template": {
+    "mappings": {
+      "properties": {
+        "timestamp":   { "type": "date" },
+        "level":       { "type": "keyword" },
+        "service":     { "type": "keyword" },
+        "event":       { "type": "keyword" },
+        "request_id":  { "type": "keyword" },
+        "order_id":    { "type": "long" },
+        "method":      { "type": "keyword" },
+        "route":       { "type": "keyword" },
+        "queue":       { "type": "keyword" },
+        "status":      { "type": "long" },
+        "duration_ms": { "type": "float" },
+        "amount":      { "type": "float" },
+        "items_count": { "type": "long" },
+        "error":       { "type": "text" },
+        "message":     { "type": "text" }
+      }
+    }
+  }
+}

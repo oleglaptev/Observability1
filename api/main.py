@@ -1,24 +1,32 @@
-from fastapi import FastAPI, Depends, HTTPException
+# Observability1/api/main.py
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from pydantic import BaseModel
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from datetime import datetime, timezone
-import pika
+import json
 import os
 import time
+import uuid
+
+import pika
 
 from api.database import engine, get_db, Base
 from api.models import Order
+from common.jsonlog import init as init_logging, log_event
+
+init_logging("api")
 
 # Создаём таблицы
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-# МЕТРИКИ
+QUEUE_NAME = "orders_queue"
 
+# ─── МЕТРИКИ (без изменений из лабы №1) ───
 REQUEST_COUNT = Counter(
     'http_requests_total',
     'Total HTTP requests',
@@ -34,10 +42,12 @@ ORDERS_CREATED = Counter(
     'Total orders created'
 )
 
-# Pydantic-схема
+
+# ─── Pydantic-схемы (без изменений) ───
 class OrderCreate(BaseModel):
     amount: float
     items_count: int
+
 
 class OrderResponse(BaseModel):
     id: int
@@ -51,28 +61,47 @@ class OrderResponse(BaseModel):
         from_attributes = True
 
 
-# Middleware для HTTP-метрик
+# ─── Middleware: request_id + метрики + логи request_started/request_finished ───
 @app.middleware("http")
-async def metrics_middleware(request, call_next):
-    start = time.time()
-    response = await call_next(request)
-    duration = time.time() - start
+async def observability_middleware(request: Request, call_next):
+    # Берём X-Request-ID от клиента или генерируем новый
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request.state.request_id = request_id
 
+    method = request.method
     route = request.url.path
-    REQUEST_COUNT.labels(
-        method=request.method,
-        route=route,
-        status=response.status_code
-    ).inc()
-    REQUEST_DURATION.labels(
-        method=request.method,
-        route=route
-    ).observe(duration)
+    start = time.perf_counter()
+
+    log_event("request_started", request_id=request_id, method=method, route=route)
+
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        duration = time.perf_counter() - start
+        REQUEST_COUNT.labels(method=method, route=route, status=500).inc()
+        REQUEST_DURATION.labels(method=method, route=route).observe(duration)
+        log_event("request_finished", level="ERROR", request_id=request_id,
+                  method=method, route=route, status=500,
+                  duration_ms=round(duration * 1000, 2), error=str(exc))
+        raise
+
+    duration = time.perf_counter() - start
+    REQUEST_COUNT.labels(method=method, route=route, status=response.status_code).inc()
+    REQUEST_DURATION.labels(method=method, route=route).observe(duration)
+
+    # Возвращаем request_id клиенту — удобно для тестирования
+    response.headers["X-Request-ID"] = request_id
+
+    log_event("request_finished", request_id=request_id, method=method, route=route,
+              status=response.status_code, duration_ms=round(duration * 1000, 2))
     return response
 
-# Пользовательские ручки
+
+# ─── Пользовательские ручки ───
 @app.post("/orders", response_model=OrderResponse)
-def create_order(order: OrderCreate, db: Session = Depends(get_db)):
+def create_order(order: OrderCreate, request: Request, db: Session = Depends(get_db)):
+    request_id = request.state.request_id
+
     new_order = Order(
         amount=order.amount,
         items_count=order.items_count,
@@ -83,24 +112,31 @@ def create_order(order: OrderCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_order)
 
-    # Отправляем в RabbitMQ
+    log_event("order_created", request_id=request_id, order_id=new_order.id,
+              amount=new_order.amount, items_count=new_order.items_count)
+
+    # Отправляем в RabbitMQ: order_id + request_id одним JSON-сообщением
     rabbitmq_host = os.getenv("RABBITMQ_HOST", "rabbitmq")
     try:
         connection = pika.BlockingConnection(
             pika.ConnectionParameters(host=rabbitmq_host)
         )
         channel = connection.channel()
-        channel.queue_declare(queue="orders_queue", durable=True)
+        channel.queue_declare(queue=QUEUE_NAME, durable=True)
+        message = json.dumps({"order_id": new_order.id, "request_id": request_id})
         channel.basic_publish(
             exchange='',
-            routing_key='orders_queue',
-            body=str(new_order.id),
-            properties=pika.BasicProperties(delivery_mode=2)
+            routing_key=QUEUE_NAME,
+            body=message,
+            properties=pika.BasicProperties(delivery_mode=2, content_type="application/json")
         )
         connection.close()
     except Exception as e:
+        log_event("message_send_failed", level="ERROR", request_id=request_id,
+                  order_id=new_order.id, queue=QUEUE_NAME, error=str(e))
         raise HTTPException(status_code=500, detail=f"RabbitMQ error: {e}")
 
+    log_event("message_sent", request_id=request_id, order_id=new_order.id, queue=QUEUE_NAME)
     ORDERS_CREATED.inc()
 
     return OrderResponse(
@@ -111,6 +147,7 @@ def create_order(order: OrderCreate, db: Session = Depends(get_db)):
         created_at=new_order.created_at.isoformat() if new_order.created_at else None,
         processed_at=new_order.processed_at.isoformat() if new_order.processed_at else None
     )
+
 
 @app.get("/orders/{order_id}", response_model=OrderResponse)
 def get_order(order_id: int, db: Session = Depends(get_db)):
@@ -123,6 +160,7 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
         created_at=order.created_at.isoformat() if order.created_at else None,
         processed_at=order.processed_at.isoformat() if order.processed_at else None
     )
+
 
 @app.get("/orders")
 def list_orders(db: Session = Depends(get_db)):
@@ -137,14 +175,17 @@ def list_orders(db: Session = Depends(get_db)):
         for o in orders
     ]
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# Технические ручки
+
+# ─── Технические ручки (без изменений) ───
 @app.get("/metrics")
 def metrics():
     return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 
 @app.get("/internal/stats")
 def internal_stats(db: Session = Depends(get_db)):
@@ -152,7 +193,6 @@ def internal_stats(db: Session = Depends(get_db)):
     orders_processing = db.query(func.count(Order.id)).filter(Order.status == "PROCESSING").scalar()
     orders_done = db.query(func.count(Order.id)).filter(Order.status == "DONE").scalar()
     last_processed = db.query(func.max(Order.processed_at)).filter(Order.status == "DONE").scalar()
-
     return {
         "orders_new": orders_new or 0,
         "orders_processing": orders_processing or 0,

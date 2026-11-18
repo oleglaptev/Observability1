@@ -1,5 +1,4 @@
-version: "3.9"
-
+# Observability1/docker-compose.yml
 services:
   # ─── PostgreSQL ───
   postgres:
@@ -60,7 +59,7 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/shopdb
       RABBITMQ_HOST: rabbitmq
-      PROCESSING_DELAY_MS: "1000"
+      PROCESSING_DELAY_MS: "5000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -141,6 +140,62 @@ services:
     volumes:
       - vm_data:/storage
 
+  # ─── Elasticsearch ───
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.3
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  # ─── Logstash ───
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.14.3
+    environment:
+      - LS_JAVA_OPTS=-Xms256m -Xmx512m
+    ports:
+      - "5044:5044"
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  # ─── Kibana ───
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.14.3
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  # ─── Filebeat ───
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.14.3
+    user: root
+    command: [ "filebeat", "-e", "--strict.perms=false" ]
+    volumes:
+      - ./filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      logstash:
+        condition: service_started
+
 volumes:
   pg_data:
   vm_data:
+  es_data:

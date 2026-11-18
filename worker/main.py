@@ -1,37 +1,56 @@
+# Observability1/worker/main.py
+import json
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 
 import pika
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from prometheus_client import Histogram, start_http_server
+
+from common.jsonlog import init as init_logging, log_event
+
+init_logging("worker")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/shopdb")
 PROCESSING_DELAY_MS = int(os.getenv("PROCESSING_DELAY_MS", "1000"))
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "rabbitmq")
 METRICS_PORT = int(os.getenv("METRICS_PORT", "9101"))
+QUEUE_NAME = "orders_queue"
 
-# ──────────────────────────────────────────────
-# МЕТРИКА (п. 3.2 из методички)
-# ──────────────────────────────────────────────
+# МЕТРИКА (без изменений из лабы №1)
 PROCESSING_DURATION = Histogram(
     'shop_order_processing_duration_seconds',
     'Time from receiving order to DONE'
 )
 
-# Подключение к БД
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 
+
+def parse_message(body: bytes) -> tuple[int, str]:
+    """Новый формат: {"order_id": 42, "request_id": "..."}.
+    Старый формат лабы №1 (просто '42') — тоже поддерживаем."""
+    raw = body.decode()
+    try:
+        payload = json.loads(raw)
+        return int(payload["order_id"]), str(payload.get("request_id") or uuid.uuid4())
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return int(raw), str(uuid.uuid4())
+
+
 def process_order(ch, method, properties, body):
-    start_time = time.time()
-    order_id = int(body.decode())
-    print(f"[Worker] Processing order {order_id}")
+    start = time.perf_counter()
+    order_id, request_id = parse_message(body)
+
+    log_event("message_received", request_id=request_id, order_id=order_id, queue=QUEUE_NAME)
 
     db = SessionLocal()
     try:
-        from sqlalchemy import text
+        log_event("processing_started", request_id=request_id, order_id=order_id)
+
         # Статус PROCESSING
         db.execute(
             text("UPDATE orders SET status = 'PROCESSING' WHERE id = :id"),
@@ -49,19 +68,23 @@ def process_order(ch, method, properties, body):
         )
         db.commit()
 
-        duration = time.time() - start_time
+        duration = time.perf_counter() - start
         PROCESSING_DURATION.observe(duration)
-        print(f"[Worker] Order {order_id} DONE in {duration:.2f}s")
+        log_event("processing_finished", request_id=request_id, order_id=order_id,
+                  duration_ms=round(duration * 1000, 2))
     except Exception as e:
-        print(f"[Worker] Error processing order {order_id}: {e}")
+        log_event("processing_failed", level="ERROR", request_id=request_id,
+                  order_id=order_id, error=str(e))
     finally:
         db.close()
-        ch.basic_ack(delivery_tag=method.delivery_tag)
+
+    ch.basic_ack(delivery_tag=method.delivery_tag)
+
 
 def main():
-    # Запускаем HTTP-сервер для метрик
     start_http_server(METRICS_PORT)
-    print(f"[Worker] Metrics server started on :{METRICS_PORT}")
+    log_event("worker_started", metrics_port=METRICS_PORT,
+              processing_delay_ms=PROCESSING_DELAY_MS)
 
     while True:
         try:
@@ -69,14 +92,15 @@ def main():
                 pika.ConnectionParameters(host=RABBITMQ_HOST, heartbeat=600)
             )
             channel = connection.channel()
-            channel.queue_declare(queue="orders_queue", durable=True)
+            channel.queue_declare(queue=QUEUE_NAME, durable=True)
             channel.basic_qos(prefetch_count=1)
-            channel.basic_consume(queue="orders_queue", on_message_callback=process_order)
-            print("[Worker] Waiting for messages...")
+            channel.basic_consume(queue=QUEUE_NAME, on_message_callback=process_order)
+            log_event("worker_waiting_messages", queue=QUEUE_NAME)
             channel.start_consuming()
         except Exception as e:
-            print(f"[Worker] Connection error: {e}. Retrying in 5s...")
+            log_event("connection_error", level="ERROR", error=str(e), retry_in_seconds=5)
             time.sleep(5)
+
 
 if __name__ == "__main__":
     main()
